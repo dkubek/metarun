@@ -589,9 +589,13 @@ mrun_run() {
     _debug "_job_command=( " "${_job_command[@]}" " )"
 
     # Create a ssh session with ControlMaster
-    _cm=/tmp/cm-$UID-$RANDOM$RANDOM$RANDOM
+    _cm=/tmp/mrun_cm-$UID-$RANDOM
+    
     ssh -M -S "${_cm}" -N "${_ssh_host}" &
     _session=$!
+
+    # Don't forget to kill the ssh session before unexpectedly exitting
+    trap 'kill ${_session}; wait ${_session}' EXIT
 
     _remote_home=$(ssh -S "${_cm}" "${_ssh_host}" "printenv HOME")
 
@@ -631,15 +635,13 @@ mrun_run() {
         printf "Job successfully submitted: %s\n" "${_job_id}."
     done
 
+    # Unset trap
+    trap - EXIT
+
     # Kill the ssh session
     _debug "Closing ssh session"
     kill "${_session}"
     wait "${_session}"
-
-    # Prepare output directories
-    # TODO
-
-    echo "${@:-}"
 }
 
 ###############################################################################
