@@ -57,7 +57,7 @@ _die() {
 # Debug
 ###############################################################################
 
-# _debug_msg()
+# _debug()
 #
 # Usage:
 #   _debug <command> <options>...
@@ -431,58 +431,247 @@ mrun_version() {
     printf "%s\\n" "${_VERSION}"
 }
 
-###############################################################################
-# Subcommands
-# ===========..................................................................
-#
-# Example subcommand group structure:
-#
-# describe example ""   - Optional. A short description for the subcommand.
-# example() { : }   - The subcommand called by the user.
-#
-#
-# describe example <<HEREDOC
-#   Usage:
-#     $_ME example
-#
-#   Description:
-#     Print "Hello, World!"
-#
-#     For usage formatting conventions see:
-#     - http://docopt.org/
-#     - http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap12.html
-# HEREDOC
-# example() {
-#   printf "Hello, World!\\n"
-# }
-#
-###############################################################################
-
-# Example Section #############################################################
-
-# --------------------------------------------------------------------- example
+# run #########################################################################
 
 describe "run" <<HEREDOC
 Usage:
-  ${_ME} run <ssh_host> (job|-j <job_file>|--job-file=<job_file>)
+  ${_ME} run <ssh-host> [-f <mrunfile> | --file=<mrunfile>] 
+                        [-n <job-name> | --name=<job-name>]
+                        [-b <batch-script> | --batch-script=<batch-script>]
+                        [-c <job-command> | --command=<job-command>]
+                        [-P]
 
 Options:
-  -j --job-file     Specify a job file (.mjob) 
+  -f, --file
+    Specify a job file (Mrunfile).
+
+  -n <job-name>, --name=<job-name>
+    Set the name of the job on remote to <job-name>.
+
+  -b <batch-script>, --batch-script=<batch-script>
+    Specify the batch script to use for the job.
+
+  -c <job-command>, --command=<job-command>
+    Specify the command to use for the job. This will be passed to the
+    <batch-script> as an JOB_COMMAND environmental variable.
+
+  -P
+    Push only. Do not run any commands.
 
 Description:
   Run a given job on MetaCentrum using the given frontend.
+
+NOTE:
+  Any arguments given as command line arguments will override settings in
+  Mrunfile.
 HEREDOC
+_execute_jobs() {
+    local _ssh_host="${1}"
+    local _job_name="${2}"
+    local _data="${3}"
+    local _batch_script="${4}"
+    local _job_command="${5}"
+    local _push_only="${6}"
+
+    # Create a ssh session with ControlMaster
+    _cm=/tmp/mrun_cm-$UID-$RANDOM
+    ssh -M -S "${_cm}" -N "${_ssh_host}" &
+    _session=$!
+
+    # Don't forget to kill the ssh session before unexpectedly exitting
+    trap 'kill ${_session}; wait ${_session}' EXIT
+
+    _remote_home=$(ssh -S "${_cm}" "${_ssh_host}" "printenv HOME")
+
+    _job_dir="${_remote_home}/jobs/${_job_name}"
+    # Ensure all relevant directories exist
+    ssh -S "${_cm}" "${_ssh_host}" \
+        "mkdir -p ${_job_dir}/{data,out}"
+
+    # Copy data files to remote
+    printf "copying data files ...\n"
+    rsync -ruz --progress -e "ssh -S ${_cm}" \
+        "${_data[@]}" "${_ssh_host}:${_job_dir}/data"
+    printf "data files copied\n"
+
+    # Copy batch script
+    printf "copying batch script ...\n"
+    rsync -ruz --progress -e "ssh -S ${_cm}" \
+        "${_batch_script}" "${_ssh_host}:${_job_dir}/${_job_name}.sh"
+    printf "batch script copied\n"
+
+    if [[ ${_push_only} != true ]]; then
+        # Run the job
+        _debug "running job"
+        _job_outdirname="$(date '+%Y%m%d%H%M%S' || true)"
+        for i in "${!_job_command[@]}"; do
+            _cmd_outdirname="$(printf "%02d" "$i")"
+            _out_dir="${_job_dir}/out/${_job_outdirname}/${_cmd_outdirname}"
+            ssh -S "${_cm}" "${_ssh_host}" "mkdir -p ${_out_dir}"
+
+            printf "submitting job ... \n"
+            _qsub_cmd="qsub -v"
+            _qsub_cmd+="JOB_COMMAND=\"${_job_command[$i]}\","
+            _qsub_cmd+="JOB_RESOURCES=${_job_dir}/data,"
+            _qsub_cmd+="JOB_OUTDIR=${_out_dir} "
+            _qsub_cmd+="-o ${_out_dir} "
+            _qsub_cmd+="-e ${_out_dir} "
+            _qsub_cmd+="-N ${_job_name} "
+            _qsub_cmd+="${_job_dir}/${_job_name}.sh"
+            _job_id=$(ssh -S "${_cm}" "${_ssh_host}" "${_qsub_cmd}")
+            printf "job successfully submitted: %s\n" "${_job_id}."
+        done
+    fi
+
+    # Unset trap
+    trap - EXIT
+
+    # Kill the ssh session
+    _debug "closing ssh session"
+    kill "${_session}"
+    wait "${_session}"
+}
+
 mrun_run() {
-    local _arguments=()
-    local _host="${1:-}"
-    local _job_file="${2:-}"
+    # Parse the ssh host
+    local _ssh_host="${1:-}"
+    [[ -n "${_ssh_host}" ]] ||
+        _die 1 "SSH host not specified!"
+    shift
+
+    local _push_only=false
+
+    local _mrunfile=
+    local _job_name=
+    local _data=
+    local _batch_script=
+    local _job_command=
 
     # Check tool availability
-    rsync="$(command -v rsync || true)"
-    [ -z "${rsync}" ] && _die 1 "rsync executable not found, cannot continue."
-    _debug "Found rsync executable at ${rsync}."
+    _debug "checking for tool availability"
+    _command_exists "rsync" ||
+        _die 1 "rsync executable not found, cannot continue."
 
-    echo "${@:-}"
+    _command_exists "ssh" ||
+        _die 1 "ssh executable not found, cannot continue."
+
+    # Parse arguments
+    while (("$#")); do
+        case "$1" in
+        -P)
+            _debug "turning on push only mode"
+            _push_only=true
+            shift
+            ;;
+        -f | --file)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                _debug "setting Mrunfile to: ${2}"
+                _mrunfile=$2
+                shift 2
+            else
+                _die 1 "Argument for $1 is missing"
+            fi
+            ;;
+        -n | --name)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                _debug "setting job name to: ${2}"
+                _job_name=$2
+                shift 2
+            else
+                _die 1 "Argument for $1 is missing"
+            fi
+            ;;
+        -b | --batch-script)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                _debug "setting batch script to: ${2}"
+                _batch_script=$2
+                shift 2
+            else
+                _die 1 "Argument for $1 is missing"
+            fi
+            ;;
+        -c | --command)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                _debug "setting command to: ${2}"
+                _job_command=$2
+                shift 2
+            else
+                _die 1 "Argument for $1 is missing"
+            fi
+            ;;
+        *)
+            _die 1 "Unexpected argument $1"
+            ;;
+        esac
+    done
+
+    # Read Mrunfile, if available abort otherwise
+    _mrunfile=${_mrunfile:-Mrunfile}
+    if [ -f "${_mrunfile}" ]; then
+        _debug "reading Mrunfile: $(readlink -f "${_mrunfile}")"
+
+        # Check Mrunfile is valid bash script
+        $(command -v bash) -n "${_mrunfile}" 2>/dev/null ||
+            _die 1 "Invalid Mrunfile!"
+
+        # shellcheck source=/dev/null
+        source "${_mrunfile}"
+    else
+        _die 1 "Please specify an Mrunfile!"
+    fi
+
+    # Set _job_name to the value given as argument or value found in Mrunfile or
+    # the name of the parent directory of Mrunfile in this order
+    _parent_dir="$(dirname "$(readlink -f "${_mrunfile}")")"
+    _parent_name="$(basename "${_parent_dir}")"
+    if [[ -n ${job_name:-} ]]; then
+        _job_name="${_job_name:-"${job_name:-"${_parent_name}"}"}"
+    else
+        _job_name="${_job_name:-"${_parent_name}"}"
+    fi
+    _debug "_job_name=${_job_name}"
+
+    _tmp=()
+    _data=("${data[@]}")
+    for __filename in "${_data[@]}"; do
+        _tmp+=("${_parent_dir}/${__filename}")
+    done
+    _data=("${_tmp[@]}")
+    # Check whether files exist
+    _debug "_data=( " "${_data[@]}" " )"
+
+    # Set _batch_script to the value given as argument or value found in
+    # Mrunfile in this order
+    if [[ -n ${batch_script:-} ]]; then
+        _batch_script="${_batch_script:-"${batch_script:-"${_job_name}.sh"}"}"
+    else
+        _batch_script="${_parent_dir}/${_batch_script:-"${_job_name}.sh"}"
+    fi
+    [[ -f "${_batch_script}" ]] ||
+        _die 1 "Batch script \"${_batch_script}\" not found!"
+    _debug "_batch_script=${_batch_script}"
+
+    # Set _job_command to the value given as argument or value found in Mrunfile
+    # in this order. Convert variable such that it is always an array
+    job_command=${job_command:-()}
+    if [[ "$(declare -p job_command)" =~ "declare -a" ]]; then
+        # If the variable job_command is an array
+        if [[ -z ${_job_command} ]]; then
+            _job_command=("${job_command[@]}")
+        fi
+    else
+        # If the variable job_command is _not_ an array
+        _job_command=("${_job_command:-${job_command:-}}")
+    fi
+    # TODO: Make a prettier debug message
+    _debug "_job_command=( " "${_job_command[@]}" " )"
+
+    _execute_jobs "${_ssh_host}" \
+        "${_job_name}" \
+        "${_data[@]}" \
+        "${_batch_script}" \
+        "${_job_command[@]}" \
+        "${_push_only}"
 }
 
 ###############################################################################
