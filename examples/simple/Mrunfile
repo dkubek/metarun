@@ -1,0 +1,25 @@
+# Name of the job. If not specified, the name of the parent directory of this
+# file will be used insted.
+job_name=simple
+
+# An array of files to copy to remote. All paths should be given relative to
+# this file
+data=(
+    simple.py
+)
+
+# Path to batch script. If not specified, "${job_name}.sh" will be used by
+# default.
+# batch_script=../../templates/singularity_tf.sh
+
+# The command to run on remote
+# Can be either a single command or an array of commands which will be run in
+# parallel in separate jobs using the same batch_script
+# 
+# command="command"
+# command=(
+#    "command_1"
+#    "command_2"
+#    "command_3"
+# )
+job_command="python simple.py"
