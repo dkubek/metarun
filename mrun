@@ -57,7 +57,7 @@ _die() {
 # Debug
 ###############################################################################
 
-# _debug_msg()
+# _debug()
 #
 # Usage:
 #   _debug <command> <options>...
@@ -439,6 +439,7 @@ Usage:
                         [-n <job-name> | --name=<job-name>]
                         [-b <batch-script> | --batch-script=<batch-script>]
                         [-c <job-command> | --command=<job-command>]
+                        [-P]
 
 Options:
   -f, --file
@@ -454,6 +455,9 @@ Options:
     Specify the command to use for the job. This will be passed to the
     <batch-script> as an JOB_COMMAND environmental variable.
 
+  -P
+    Push only. Do not run any commands.
+
 Description:
   Run a given job on MetaCentrum using the given frontend.
 
@@ -461,12 +465,81 @@ NOTE:
   Any arguments given as command line arguments will override settings in
   Mrunfile.
 HEREDOC
+_execute_jobs() {
+    local _ssh_host="${1}"
+    local _job_name="${2}"
+    local _data="${3}"
+    local _batch_script="${4}"
+    local _job_command="${5}"
+    local _push_only="${6}"
+
+    # Create a ssh session with ControlMaster
+    _cm=/tmp/mrun_cm-$UID-$RANDOM
+    ssh -M -S "${_cm}" -N "${_ssh_host}" &
+    _session=$!
+
+    # Don't forget to kill the ssh session before unexpectedly exitting
+    trap 'kill ${_session}; wait ${_session}' EXIT
+
+    _remote_home=$(ssh -S "${_cm}" "${_ssh_host}" "printenv HOME")
+
+    _job_dir="${_remote_home}/jobs/${_job_name}"
+    # Ensure all relevant directories exist
+    ssh -S "${_cm}" "${_ssh_host}" \
+        "mkdir -p ${_job_dir}/{data,out}"
+
+    # Copy data files to remote
+    printf "copying data files ...\n"
+    rsync -ruz --progress -e "ssh -S ${_cm}" \
+        "${_data[@]}" "${_ssh_host}:${_job_dir}/data"
+    printf "data files copied\n"
+
+    # Copy batch script
+    printf "copying batch script ...\n"
+    rsync -ruz --progress -e "ssh -S ${_cm}" \
+        "${_batch_script}" "${_ssh_host}:${_job_dir}/${_job_name}.sh"
+    printf "batch script copied\n"
+
+    if [[ ${_push_only} != true ]]; then
+        # Run the job
+        _debug "running job"
+        _job_outdirname="$(date '+%Y%m%d%H%M%S' || true)"
+        for i in "${!_job_command[@]}"; do
+            _cmd_outdirname="$(printf "%02d" "$i")"
+            _out_dir="${_job_dir}/out/${_job_outdirname}/${_cmd_outdirname}"
+            ssh -S "${_cm}" "${_ssh_host}" "mkdir -p ${_out_dir}"
+
+            printf "submitting job ... \n"
+            _qsub_cmd="qsub -v"
+            _qsub_cmd+="JOB_COMMAND=\"${_job_command[$i]}\","
+            _qsub_cmd+="JOB_RESOURCES=${_job_dir}/data,"
+            _qsub_cmd+="JOB_OUTDIR=${_out_dir} "
+            _qsub_cmd+="-o ${_out_dir} "
+            _qsub_cmd+="-e ${_out_dir} "
+            _qsub_cmd+="-N ${_job_name} "
+            _qsub_cmd+="${_job_dir}/${_job_name}.sh"
+            _job_id=$(ssh -S "${_cm}" "${_ssh_host}" "${_qsub_cmd}")
+            printf "job successfully submitted: %s\n" "${_job_id}."
+        done
+    fi
+
+    # Unset trap
+    trap - EXIT
+
+    # Kill the ssh session
+    _debug "closing ssh session"
+    kill "${_session}"
+    wait "${_session}"
+}
+
 mrun_run() {
     # Parse the ssh host
     local _ssh_host="${1:-}"
     [[ -n "${_ssh_host}" ]] ||
         _die 1 "SSH host not specified!"
     shift
+
+    local _push_only=false
 
     local _mrunfile=
     local _job_name=
@@ -475,7 +548,7 @@ mrun_run() {
     local _job_command=
 
     # Check tool availability
-    _debug "Checking for tool availability"
+    _debug "checking for tool availability"
     _command_exists "rsync" ||
         _die 1 "rsync executable not found, cannot continue."
 
@@ -485,9 +558,14 @@ mrun_run() {
     # Parse arguments
     while (("$#")); do
         case "$1" in
+        -P)
+            _debug "turning on push only mode"
+            _push_only=true
+            shift
+            ;;
         -f | --file)
             if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
-                _debug "Setting Mrunfile to: ${2}"
+                _debug "setting Mrunfile to: ${2}"
                 _mrunfile=$2
                 shift 2
             else
@@ -496,7 +574,7 @@ mrun_run() {
             ;;
         -n | --name)
             if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
-                _debug "Setting job name to: ${2}"
+                _debug "setting job name to: ${2}"
                 _job_name=$2
                 shift 2
             else
@@ -505,7 +583,7 @@ mrun_run() {
             ;;
         -b | --batch-script)
             if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
-                _debug "Setting batch script to: ${2}"
+                _debug "setting batch script to: ${2}"
                 _batch_script=$2
                 shift 2
             else
@@ -514,7 +592,7 @@ mrun_run() {
             ;;
         -c | --command)
             if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
-                _debug "Setting command to: ${2}"
+                _debug "setting command to: ${2}"
                 _job_command=$2
                 shift 2
             else
@@ -530,7 +608,7 @@ mrun_run() {
     # Read Mrunfile, if available abort otherwise
     _mrunfile=${_mrunfile:-Mrunfile}
     if [ -f "${_mrunfile}" ]; then
-        _debug "Reading Mrunfile: $(readlink -f "${_mrunfile}")"
+        _debug "reading Mrunfile: $(readlink -f "${_mrunfile}")"
 
         # Check Mrunfile is valid bash script
         $(command -v bash) -n "${_mrunfile}" 2>/dev/null ||
@@ -588,60 +666,12 @@ mrun_run() {
     # TODO: Make a prettier debug message
     _debug "_job_command=( " "${_job_command[@]}" " )"
 
-    # Create a ssh session with ControlMaster
-    _cm=/tmp/mrun_cm-$UID-$RANDOM
-    
-    ssh -M -S "${_cm}" -N "${_ssh_host}" &
-    _session=$!
-
-    # Don't forget to kill the ssh session before unexpectedly exitting
-    trap 'kill ${_session}; wait ${_session}' EXIT
-
-    _remote_home=$(ssh -S "${_cm}" "${_ssh_host}" "printenv HOME")
-
-    _job_dir="${_remote_home}/jobs/${_job_name}"
-    # Ensure all relevant directories exist
-    ssh -S "${_cm}" "${_ssh_host}" \
-        "mkdir -p ${_job_dir}/{data,out}"
-
-    # Copy data files to remote
-    _debug "Copying data files"
-    rsync -rvu --progress -e "ssh -S ${_cm}" \
-        "${data[@]}" "${_ssh_host}:${_job_dir}/data"
-
-    # Copy batch script
-    _debug "Copying batch script"
-    rsync -ruz --progress -e "ssh -S ${_cm}" \
-        "${_batch_script}" "${_ssh_host}:${_job_dir}/${_job_name}.sh"
-
-    # Run the job
-    _debug "Running job"
-    _job_outdirname="$(date '+%Y%m%d%H%M%S' || true)"
-    for i in "${!_job_command[@]}"; do
-        _cmd_outdirname="$(printf "%02d" "$i")"
-        _out_dir="${_job_dir}/out/${_job_outdirname}/${_cmd_outdirname}"
-        ssh -S "${_cm}" "${_ssh_host}" "mkdir -p ${_out_dir}"
-
-        printf "Submitting job ... \n"
-        _qsub_cmd="qsub -v"
-        _qsub_cmd+="JOB_COMMAND=\"${_job_command[$i]}\","
-        _qsub_cmd+="JOB_RESOURCES=${_job_dir}/data,"
-        _qsub_cmd+="JOB_OUTDIR=${_out_dir} "
-        _qsub_cmd+="-o ${_out_dir} "
-        _qsub_cmd+="-e ${_out_dir} "
-        _qsub_cmd+="-N ${_job_name} "
-        _qsub_cmd+="${_job_dir}/${_job_name}.sh"
-        _job_id=$(ssh -S "${_cm}" "${_ssh_host}" "${_qsub_cmd}")
-        printf "Job successfully submitted: %s\n" "${_job_id}."
-    done
-
-    # Unset trap
-    trap - EXIT
-
-    # Kill the ssh session
-    _debug "Closing ssh session"
-    kill "${_session}"
-    wait "${_session}"
+    _execute_jobs "${_ssh_host}" \
+        "${_job_name}" \
+        "${_data[@]}" \
+        "${_batch_script}" \
+        "${_job_command[@]}" \
+        "${_push_only}"
 }
 
 ###############################################################################
