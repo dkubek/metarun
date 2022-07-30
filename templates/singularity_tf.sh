@@ -21,7 +21,8 @@
 ###############################################################################
 
 # Allocate resources:
-#PBS -l select=1:ncpus=24:mem=16gb:scratch_local=32gb
+#PBS -l select=1:ncpus=24:ngpus=1:mem=16gb:scratch_local=32gb
+#PBS -q gpu
 
 #PBS -l walltime=8:00:00
 
