@@ -468,9 +468,11 @@ HEREDOC
 _execute_jobs() {
     local _ssh_host="${1}"
     local _job_name="${2}"
-    local _data="${3}"
+    local _data=
+    mapfile -t _data <<<"${3}"
     local _batch_script="${4}"
-    local _job_command="${5}"
+    local _job_command=
+    mapfile -t _job_command <<<"${5}"
     local _push_only="${6}"
 
     # Create a ssh session with ControlMaster
@@ -484,6 +486,7 @@ _execute_jobs() {
     _remote_home=$(ssh -S "${_cm}" "${_ssh_host}" "printenv HOME")
 
     _job_dir="${_remote_home}/jobs/${_job_name}"
+    _debug "_job_dir=${_job_dir}"
     # Ensure all relevant directories exist
     ssh -S "${_cm}" "${_ssh_host}" \
         "mkdir -p ${_job_dir}/{data,out}"
@@ -500,7 +503,7 @@ _execute_jobs() {
         "${_batch_script}" "${_ssh_host}:${_job_dir}/${_job_name}.sh"
     printf "batch script copied\n"
 
-    if [[ ${_push_only} != true ]]; then
+    if [ "${_push_only}" -eq 0 ]; then
         # Run the job
         _debug "running job"
         _job_outdirname="$(date '+%Y%m%d%H%M%S' || true)"
@@ -539,13 +542,13 @@ mrun_run() {
         _die 1 "SSH host not specified!"
     shift
 
-    local _push_only=false
+    local _push_only=0
 
     local _mrunfile=
     local _job_name=
-    local _data=
+    local _data=()
     local _batch_script=
-    local _job_command=
+    local _job_command=()
 
     # Check tool availability
     _debug "checking for tool availability"
@@ -560,7 +563,7 @@ mrun_run() {
         case "$1" in
         -P)
             _debug "turning on push only mode"
-            _push_only=true
+            _push_only=1
             shift
             ;;
         -f | --file)
@@ -593,7 +596,7 @@ mrun_run() {
         -c | --command)
             if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
                 _debug "setting command to: ${2}"
-                _job_command=$2
+                _job_command=("$2")
                 shift 2
             else
                 _die 1 "Argument for $1 is missing"
@@ -631,6 +634,7 @@ mrun_run() {
     fi
     _debug "_job_name=${_job_name}"
 
+    # Prepend the path of Metafile location to all data files
     _tmp=()
     _data=("${data[@]}")
     for __filename in "${_data[@]}"; do
@@ -653,25 +657,42 @@ mrun_run() {
 
     # Set _job_command to the value given as argument or value found in Mrunfile
     # in this order. Convert variable such that it is always an array
-    job_command=${job_command:-()}
+    job_command=${job_command:-}
     if [[ "$(declare -p job_command)" =~ "declare -a" ]]; then
         # If the variable job_command is an array
-        if [[ -z ${_job_command} ]]; then
+        if [ ${#_job_command[@]} -eq 0 ]; then
             _job_command=("${job_command[@]}")
         fi
     else
         # If the variable job_command is _not_ an array
-        _job_command=("${_job_command:-${job_command:-}}")
+        _job_command=("${_job_command[@]:-${job_command:-}}")
     fi
     # TODO: Make a prettier debug message
     _debug "_job_command=( " "${_job_command[@]}" " )"
 
     _execute_jobs "${_ssh_host}" \
         "${_job_name}" \
-        "${_data[@]}" \
+        "${_data[*]}" \
         "${_batch_script}" \
-        "${_job_command[@]}" \
+        "${_job_command[*]}" \
         "${_push_only}"
+}
+
+# status ######################################################################
+
+describe "status" <<HEREDOC
+Usage:
+  ${_ME} status <ssh-host> [-n <job-name> | --name=<job-name>]
+
+Options:
+  -n <job-name>, --name=<job-name>
+    Query the status of jobs associated with <job-name>.
+
+Description:
+  Query the status of jobs on the given host.
+HEREDOC
+mrun_status() {
+    echo "TODO: STATUS SUBCOMMAND"
 }
 
 ###############################################################################
