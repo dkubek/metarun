@@ -16,8 +16,8 @@ data=(
 # Can be either a single command or an array of commands which will be run in
 # parallel in separate jobs using the same batch_script
 # 
-# command="command"
-# command=(
+# job_command="command"
+# job_command=(
 #    "command_1"
 #    "command_2"
 #    "command_3"
