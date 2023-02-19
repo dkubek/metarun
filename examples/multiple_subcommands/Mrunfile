@@ -1,11 +1,11 @@
 # Name of the job. If not specified, the name of the parent directory of this
 # file will be used insted.
-job_name=simple
+job_name=multiple_subcommands
 
 # An array of files to copy to remote. All paths should be given relative to
 # this file
 data=(
-    simple.py
+    ./multiple_subcommands.py
 )
 
 # Path to batch script. If not specified, "${job_name}.sh" will be used by
@@ -22,7 +22,11 @@ data=(
 #    "command_2"
 #    "command_3"
 # )
-#
+#__
 # WARNING: It's very important to quote the commands, otherwise each word
 # separated by space will be interpreted as a separate command!
-job_command="python simple.py"
+
+job_command=(
+    "python multiple_subcommands.py 1"
+    "python multiple_subcommands.py 2"
+)
