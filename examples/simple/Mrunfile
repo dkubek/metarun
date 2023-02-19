@@ -22,4 +22,7 @@ data=(
 #    "command_2"
 #    "command_3"
 # )
+#
+# WARNING: It's very important to quote the commands, otherwise each word
+# separated by space will be interpreted as a separate command!
 job_command="python simple.py"

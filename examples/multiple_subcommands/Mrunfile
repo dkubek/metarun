@@ -22,6 +22,10 @@ data=(
 #    "command_2"
 #    "command_3"
 # )
+#__
+# WARNING: It's very important to quote the commands, otherwise each word
+# separated by space will be interpreted as a separate command!
+
 job_command=(
     "python multiple_subcommands.py 1"
     "python multiple_subcommands.py 2"
