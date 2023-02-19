@@ -478,12 +478,12 @@ _setup_ssh() {
 
     _debug "_setup_ssh(): creating an ssh session on host - ${_ssh_host}"
     # Create a ssh session with ControlMaster
-    _cm=/tmp/mrun_cm-$UID-$RANDOM
-    ssh -M -S "${_cm}" -N "${_ssh_host}" &
-    _session=$!
+    cm=/tmp/mruncm-$UID-$RANDOM
+    ssh -M -S "${cm}" -NT "${_ssh_host}" &
+    session=$!
 
     # Don't forget to kill the ssh session before unexpectedly exitting
-    trap 'kill ${_session}; wait ${_session}' EXIT
+    trap 'kill ${session}; wait ${session}' EXIT
 }
 
 _teardown_ssh() {
@@ -492,8 +492,8 @@ _teardown_ssh() {
 
     # Kill the ssh session
     _debug "_teardown_ssh(): closing ssh session"
-    kill "${_session}"
-    wait "${_session}"
+    kill "${session}"
+    wait "${session}"
 }
 
 
@@ -510,23 +510,23 @@ _execute_jobs() {
 
     _setup_ssh "${_ssh_host}"
 
-    _remote_home=$(ssh -S "${_cm}" "${_ssh_host}" "printenv HOME")
+    _remote_home=$(ssh -S "${cm}" "${_ssh_host}" "printenv HOME")
 
     _job_dir="${_remote_home}/${_JOBS_DIRNAME}/${_job_name}"
     _debug "_job_dir=${_job_dir}"
     # Ensure all relevant directories exist
-    ssh -S "${_cm}" "${_ssh_host}" \
+    ssh -S "${cm}" "${_ssh_host}" \
         "mkdir -p ${_job_dir}/{data,out}"
 
     # Copy data files to remote
     printf "copying data files ...\n"
-    rsync -ruz --progress -e "ssh -S ${_cm}" \
+    rsync -ruz --progress -e "ssh -S ${cm}" \
         "${_data[@]}" "${_ssh_host}:${_job_dir}/data"
     printf "data files copied\n"
 
     # Copy batch script
     printf "copying batch script ...\n"
-    rsync -ruz --progress -e "ssh -S ${_cm}" \
+    rsync -ruz --progress -e "ssh -S ${cm}" \
         "${_batch_script}" "${_ssh_host}:${_job_dir}/${_job_name}.sh"
     printf "batch script copied\n"
 
@@ -534,27 +534,28 @@ _execute_jobs() {
         # Run the job
         _debug "running job"
         _job_run_id="$(od -A n -t x -N 4 /dev/urandom | tr -d ' ')"
+        _timestamp=$(date '+%s')
         for i in "${!_job_command[@]}"; do
-            _cmd_outdirname="$(printf "%02d" "$i")"
-            _out_dir="${_job_dir}/out/${_job_run_id}/${_cmd_outdirname}"
-            ssh -S "${_cm}" "${_ssh_host}" "mkdir -p ${_out_dir}"
+            cmd_outdirname="$(printf "%02d" "$i")"
+            _out_dir="${_job_dir}/out/${_job_run_id}/${cmd_outdirname}"
+            ssh -S "${cm}" "${_ssh_host}" "mkdir -p ${_out_dir}"
 
             printf "submitting job ... \n"
-            _qsub_cmd="qsub -v"
-            _qsub_cmd+="JOB_COMMAND=\"${_job_command[$i]}\","
-            _qsub_cmd+="JOB_RESOURCES=${_job_dir}/data,"
-            _qsub_cmd+="JOB_OUTDIR=${_out_dir} "
-            _qsub_cmd+="-o ${_out_dir} "
-            _qsub_cmd+="-e ${_out_dir} "
-            _qsub_cmd+="-N ${_job_name} "
-            _qsub_cmd+="${_job_dir}/${_job_name}.sh"
-            _job_id=$(ssh -S "${_cm}" "${_ssh_host}" "${_qsub_cmd}")
+            _qsubcmd="qsub -v"
+            _qsubcmd+="JOB_COMMAND=\"${_job_command[$i]}\","
+            _qsubcmd+="JOB_RESOURCES=${_job_dir}/data,"
+            _qsubcmd+="JOB_OUTDIR=${_out_dir} "
+            _qsubcmd+="-o ${_out_dir} "
+            _qsubcmd+="-e ${_out_dir} "
+            _qsubcmd+="-N ${_job_name} "
+            _qsubcmd+="${_job_dir}/${_job_name}.sh"
+            _job_id=$(ssh -S "${cm}" "${_ssh_host}" "${_qsubcmd}")
             printf "job ${_job_run_id}/$i successfully submitted: %s\n" "${_job_id}."
 
             _details="$(printf "%s\t%s\t%s\t%s\t%s\t%s" \
                 "${_job_run_id}" "${_job_name}" "$i" \
-                "$(date '+%s')" "${_job_id}" "${_job_command[$i]}")"
-            ssh -S "${_cm}" "${_ssh_host}" \
+                "${_timestamp}" "${_job_id}" "${_job_command[$i]}")"
+            ssh -S "${cm}" "${_ssh_host}" \
                 "echo '${_details}' > ${_out_dir}/.details"
         done
     fi
@@ -733,6 +734,126 @@ Options:
 Description:
   Query the status of jobs on the given host.
 HEREDOC
+
+_set_color_by_status() {
+    local _status=$1
+
+    case "$_status" in
+        "S" | "H" | "UNK")
+            # red
+            printf "%s" "$(tput setaf 1)"
+            ;;
+        "F" | "M" )
+            # green
+            printf "%s" "$(tput setaf 2)"
+            ;;
+        "Q" | "E")
+            # yellow 
+            printf "%s" "$(tput setaf 3)"
+            ;;
+        "R")
+            # blue 
+            printf "%s" "$(tput setaf 4)"
+            ;;
+        *)
+            # default
+            printf "%s" "$(tput sgr0)"
+            ;;
+
+    esac
+
+}
+
+_get_job_status() {
+    local _job_id=$1
+
+    local _status=
+    _status=$(ssh -S "${cm}" "${_ssh_host}" \
+        "qstat -iJ \"${_job_id}\" 2>&1 || true"
+    )
+    if [[ "$_status" == *"Job has finished"* ]]; then
+        _status=$(ssh -S "${cm}" "${_ssh_host}" \
+            "qstat -ix \"${_job_id}\" " \
+            "| tail -1 " \
+            "| tr -s ' ' " \
+            "| cut -f10 -d' '"
+        )
+
+        case "$_status" in
+            "M" | "F" )
+                _status="F"
+                ;;
+            *)
+                _status="UNK"
+        esac
+
+    else
+        _status=$(echo "${_status}" | tail -1 | tr -s ' ' | cut -f10 -d' ')
+    fi
+
+    echo "${_status}"
+
+}
+
+_reset_color() {
+    printf "%s" "$(tput sgr0)"
+}
+
+_print_group() {
+    mapfile -t _group <<<"${@}"
+    read -ra _tmp <<<"${_group[0]}"
+    _mrun_id=${_tmp[0]}
+
+    cat <<HEREDOC
+${_mrun_id}  ┌  JOB_NAME        NO.  STATUS  TIME CREATED         ELAPSED   COMMAND
+          ├  --------------  ---  ------  -------------------  --------  -------
+HEREDOC
+
+    local _current_time=
+    _current_time="$(date +'%s')"
+
+    for _entry in "${_group[@]}"; do
+        read -ra _entry <<<"${_entry}"
+
+        local _job_name="${_entry[1]}"
+        local _job_id=${_entry[4]}
+
+        local _status=
+        _status=$(_get_job_status "${_job_id}")
+
+        _set_color_by_status "$_status"
+
+        local _job_subcommand_no=${_entry[2]}
+        local _time_created=${_entry[3]}
+        local _command=${_entry[5]}
+
+        # Format strings
+        _time_elapsed=$(date -u -d @"$((_current_time - _time_created))" +'%T')
+        if [ ${#_job_name} -gt 14 ]; then
+            _job_name="${_job_name:0:13}*"
+        else
+            _job_name=$(printf "%-14s" "${_job_name}")
+        fi
+
+        _job_subcommand_no=$(printf "%+3s" "${_job_subcommand_no}")
+        _status=$(printf "%*s" 6 "${_status}")
+        _time_created=$(date -u -d @"${_time_created}" +'%F %T')
+
+
+        printf "          ●  %s  %s  %s  %s  %s  %s\n" \
+            "${_job_name}" \
+            "${_job_subcommand_no}" \
+            "${_status}" \
+            "${_time_created}" \
+            "${_time_elapsed}" \
+            "${_command}"
+
+        _reset_color
+    done
+    echo
+
+}
+
 mrun_status() {
     local _ssh_host="${1:-}"
     [[ -n "${_ssh_host}" ]] ||
@@ -741,11 +862,10 @@ mrun_status() {
 
     _check_tools
 
+    # Parse arguments
     local _entries_to_show=3
     local _mrun_id=
     local _job_id_prefix=
-
-    # Parse arguments
     while (("$#")); do
         case "$1" in
         -a)
@@ -778,19 +898,25 @@ mrun_status() {
     done
 
     _setup_ssh "$_ssh_host"
-    [ -n "$_cm" ] && [ -n "$_session" ]
+    [ -n "$cm" ] && [ -n "$session" ]
 
-    _remote_home=$(ssh -S "${_cm}" "${_ssh_host}" "printenv HOME")
+    # Get information from the remote
+    local _remote_home=
+    local _jobs_dir=
+    local _job_entries=
+    local _no_entries=
+    _remote_home=$(ssh -S "${cm}" "${_ssh_host}" "printenv HOME")
     _jobs_dir="${_remote_home}/${_JOBS_DIRNAME}"
-    _job_entries=$(ssh -S "${_cm}" "${_ssh_host}" \
+    _job_entries=$(ssh -S "${cm}" "${_ssh_host}" \
         "find $_jobs_dir -name .details -exec cat {} + "\
         "| grep \"^${_job_id_prefix}\"" \
         "| sort -k4nr -k3"
     )
     _no_entries=$(echo "${_job_entries}" | wc -l)
 
-    _group=()
-    _prev_job_run_id=
+    # Print information by groups
+    local _group=()
+    local _prev_job_run_id=
     if [ "$_no_entries" -gt 0 ]
     then
         local _group_cnt=0
@@ -804,100 +930,7 @@ mrun_status() {
                 _group+=( "$_line" )
                 _prev_job_run_id="$_job_run_id"
             else
-
-                # Print group
-                read -ra _tmp <<<"${_group[0]}"
-                _mrun_id=${_tmp[0]}
-
-                cat <<HEREDOC
-${_mrun_id}  ┌  JOB_NAME        NO.  STATUS  TIME CREATED         ELAPSED   COMMAND
-	  ├  --------------  ---  ------  -------------------  --------  -------
-HEREDOC
-
-                _current_time="$(date +'%s')"
-
-                for _entry in "${_group[@]}"; do
-                    read -ra _entry <<<"${_entry}"
-
-                    _job_name="${_entry[1]}"
-                    _job_id=${_entry[4]}
-
-                    _status=$(ssh -S "${_cm}" "${_ssh_host}" \
-                        "qstat -iJ \"${_job_id}\" 2>&1 || true"
-                    )
-                    if [[ "$_status" == *"Job has finished"* ]]; then
-                        _status=$(ssh -S "${_cm}" "${_ssh_host}" \
-                            "qstat -ix \"${_job_id}\"" \
-                            "| tail -1 " \
-                            "| tr -s ' ' " \
-                            "| cut -f10 -d' '"
-                        )
-
-                        case "$_status" in
-                            "M" | "F" )
-                                _status="F"
-                                ;;
-                            *)
-                                _status="UNK"
-                        esac
-
-                    else
-                        _status=$(echo "${_status}" | tail -1 | tr -s ' ' | cut -f10 -d' ')
-                    fi
-
-
-                    _job_subcommand_no=${_entry[2]}
-                    _time_created=${_entry[3]}
-                    _command=${_entry[5]}
-
-                    # Set color
-                    case "$_status" in
-                        "S" | "H" | "UNK")
-                            # red
-                            printf "%s" "$(tput setaf 1)"
-                            ;;
-                        "F" | "M" )
-                            # green
-                            printf "%s" "$(tput setaf 2)"
-                            ;;
-                        "Q" | "E")
-                            # yellow 
-                            printf "%s" "$(tput setaf 3)"
-                            ;;
-                        "R")
-                            # blue 
-                            printf "%s" "$(tput setaf 4)"
-                            ;;
-                        *)
-                            # default
-                            printf "%s" "$(tput sgr0)"
-                            ;;
-
-                    esac
-
-                    # Format strings
-                    _time_elapsed=$(date -u -d @"$((_current_time - _time_created))" +'%T')
-                    if [ ${#_job_name} -gt 14 ]; then
-                        _job_name="${_job_name:0:13}*"
-                    else
-                        _job_name=$(printf "%-14s" "${_job_name}")
-                    fi
-
-                    _job_subcommand_no=$(printf "%+3s" "${_job_subcommand_no}")
-                    _status=$(printf "%*s" 6 "${_status}")
-                    _time_created=$(date -u -d @"${_time_created}" +'%F %T')
-
-
-                    printf "          ●  %s  %s  %s  %s  %s  %s\n" \
-                        "${_job_name}" \
-                        "${_job_subcommand_no}" \
-                        "${_status}" \
-                        "${_time_created}" \
-                        "${_time_elapsed}" \
-                        "${_command}"
-                    printf "%s" "$(tput sgr0)"
-                done
-                echo
+                _print_group "${_group[*]}"
 
                 _group_cnt=$(( _group_cnt + 1 ))
                 _group=( "$_line" )
@@ -914,7 +947,6 @@ HEREDOC
         done
     fi
 
-    
     _teardown_ssh
 }
 
