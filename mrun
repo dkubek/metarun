@@ -36,6 +36,9 @@ _VERSION="0.1.0-alpha"
 # is used.
 DEFAULT_SUBCOMMAND="${DEFAULT_SUBCOMMAND:-help}"
 
+# The ssh host name to use.
+MRUN_SSH_HOST="${MRUN_SSH_HOST:-localhost}"
+
 # _die()
 #
 # Usage:
@@ -474,16 +477,19 @@ HEREDOC
 
 
 _setup_ssh() {
-    local _ssh_host="${1}"
-
-    _debug "_setup_ssh(): creating an ssh session on host - ${_ssh_host}"
+    _debug "_setup_ssh(): trying to create a connection to host - ${MRUN_SSH_HOST}"
     # Create a ssh session with ControlMaster
     cm=/tmp/mruncm-$UID-$RANDOM
-    ssh -M -S "${cm}" -NT "${_ssh_host}" &
-    session=$!
+    local _pidfile="/tmp/mrun_ssh-$UID-$RANDOM.pid"
+    ssh -M -S "${cm}" -fN "${MRUN_SSH_HOST}"
+    session=$(
+        ssh -S "${cm}" -O check "${MRUN_SSH_HOST}" 2>&1 \
+        | sed 's/.*(pid=\(.*\))/\1/'
+    )
+    _debug "_setup_ssh(): connection established"
 
     # Don't forget to kill the ssh session before unexpectedly exitting
-    trap 'kill ${session}; wait ${session}' EXIT
+    trap 'ssh -S "${cm}" -O exit "${MRUN_SSH_HOST}" 2>/dev/null' EXIT
 }
 
 _teardown_ssh() {
@@ -492,14 +498,13 @@ _teardown_ssh() {
 
     # Kill the ssh session
     _debug "_teardown_ssh(): closing ssh session"
-    kill "${session}"
-    wait "${session}"
+    ssh -S "${cm}" -O exit "${MRUN_SSH_HOST}" 2>/dev/null
 }
 
 
 
 _execute_jobs() {
-    local _ssh_host="${1}"
+    local MRUN_SSH_HOST="${1}"
     local _job_name="${2}"
     local _data=
     mapfile -t _data <<<"${3}"
@@ -508,26 +513,26 @@ _execute_jobs() {
     mapfile -t _job_command <<<"${5}"
     local _push_only="${6}"
 
-    _setup_ssh "${_ssh_host}"
+    _setup_ssh
 
-    _remote_home=$(ssh -S "${cm}" "${_ssh_host}" "printenv HOME")
+    _remote_home=$(ssh -S "${cm}" "${MRUN_SSH_HOST}" "printenv HOME")
 
     _job_dir="${_remote_home}/${_JOBS_DIRNAME}/${_job_name}"
     _debug "_job_dir=${_job_dir}"
     # Ensure all relevant directories exist
-    ssh -S "${cm}" "${_ssh_host}" \
+    ssh -S "${cm}" "${MRUN_SSH_HOST}" \
         "mkdir -p ${_job_dir}/{data,out}"
 
     # Copy data files to remote
     printf "copying data files ...\n"
     rsync -ruz --progress -e "ssh -S ${cm}" \
-        "${_data[@]}" "${_ssh_host}:${_job_dir}/data"
+        "${_data[@]}" "${MRUN_SSH_HOST}:${_job_dir}/data"
     printf "data files copied\n"
 
     # Copy batch script
     printf "copying batch script ...\n"
     rsync -ruz --progress -e "ssh -S ${cm}" \
-        "${_batch_script}" "${_ssh_host}:${_job_dir}/${_job_name}.sh"
+        "${_batch_script}" "${MRUN_SSH_HOST}:${_job_dir}/${_job_name}.sh"
     printf "batch script copied\n"
 
     if [ "${_push_only}" -eq 0 ]; then
@@ -536,9 +541,8 @@ _execute_jobs() {
         _job_run_id="$(od -A n -t x -N 4 /dev/urandom | tr -d ' ')"
         _timestamp=$(date '+%s')
         for i in "${!_job_command[@]}"; do
-            cmd_outdirname="$(printf "%02d" "$i")"
-            _out_dir="${_job_dir}/out/${_job_run_id}/${cmd_outdirname}"
-            ssh -S "${cm}" "${_ssh_host}" "mkdir -p ${_out_dir}"
+            _out_dir="${_job_dir}/out/${_job_run_id}/${i}"
+            ssh -S "${cm}" "${MRUN_SSH_HOST}" "mkdir -p ${_out_dir}"
 
             printf "submitting job ... \n"
             _qsubcmd="qsub -v"
@@ -549,13 +553,13 @@ _execute_jobs() {
             _qsubcmd+="-e ${_out_dir} "
             _qsubcmd+="-N ${_job_name} "
             _qsubcmd+="${_job_dir}/${_job_name}.sh"
-            _job_id=$(ssh -S "${cm}" "${_ssh_host}" "${_qsubcmd}")
+            _job_id=$(ssh -S "${cm}" "${MRUN_SSH_HOST}" "${_qsubcmd}")
             printf "job ${_job_run_id}/$i successfully submitted: %s\n" "${_job_id}."
 
             _details="$(printf "%s\t%s\t%s\t%s\t%s\t%s" \
                 "${_job_run_id}" "${_job_name}" "$i" \
                 "${_timestamp}" "${_job_id}" "${_job_command[$i]}")"
-            ssh -S "${cm}" "${_ssh_host}" \
+            ssh -S "${cm}" "${MRUN_SSH_HOST}" \
                 "echo '${_details}' > ${_out_dir}/.details"
         done
     fi
@@ -576,8 +580,8 @@ _check_tools() {
 
 mrun_run() {
     # Parse the ssh host
-    local _ssh_host="${1:-}"
-    [[ -n "${_ssh_host}" ]] ||
+    MRUN_SSH_HOST="${1:-}"
+    [[ -n "${MRUN_SSH_HOST}" ]] ||
         _die 1 "SSH host not specified!"
     shift
 
@@ -703,7 +707,7 @@ mrun_run() {
     # TODO: Make a prettier debug message
     _debug "_job_command=( " "${_job_command[@]}" " )"
 
-    _execute_jobs "${_ssh_host}" \
+    _execute_jobs "${MRUN_SSH_HOST}" \
         "${_job_name}" \
         "${_data[*]}" \
         "${_batch_script}" \
@@ -767,12 +771,13 @@ _set_color_by_status() {
 _get_job_status() {
     local _job_id=$1
 
+    #ssh -S "${cm}" "${MRUN_SSH_HOST}" "printenv HOME"
     local _status=
-    _status=$(ssh -S "${cm}" "${_ssh_host}" \
+    _status=$(ssh -S "${cm}" "${MRUN_SSH_HOST}" \
         "qstat -iJ \"${_job_id}\" 2>&1 || true"
     )
     if [[ "$_status" == *"Job has finished"* ]]; then
-        _status=$(ssh -S "${cm}" "${_ssh_host}" \
+        _status=$(ssh -S "${cm}" "${MRUN_SSH_HOST}" \
             "qstat -ix \"${_job_id}\" " \
             "| tail -1 " \
             "| tr -s ' ' " \
@@ -784,9 +789,12 @@ _get_job_status() {
                 _status="F"
                 ;;
             *)
-                _status="UNK"
+                _status="ERR"
+                ;;
         esac
 
+    elif [[ "$_status" == *"Unknown Job Id"* ]]; then
+        _status="UNK"
     else
         _status=$(echo "${_status}" | tail -1 | tr -s ' ' | cut -f10 -d' ')
     fi
@@ -854,9 +862,21 @@ HEREDOC
 
 }
 
+_get_job_info() {
+    local _remote_home=
+    local _jobs_dir=
+    local _job_entries=
+    _remote_home=$(ssh -S "${cm}" "${MRUN_SSH_HOST}" "printenv HOME")
+    _jobs_dir="${_remote_home}/${_JOBS_DIRNAME}"
+
+    ssh -S "${cm}" "${MRUN_SSH_HOST}" \
+        "find $_jobs_dir -name .details -exec cat {} + "\
+        "| sort -k4nr -k3"
+}
+
 mrun_status() {
-    local _ssh_host="${1:-}"
-    [[ -n "${_ssh_host}" ]] ||
+    MRUN_SSH_HOST="${1:-}"
+    [[ -n "${MRUN_SSH_HOST}" ]] ||
         _die 1 "SSH host not specified!"
     shift
 
@@ -897,21 +917,13 @@ mrun_status() {
         esac
     done
 
-    _setup_ssh "$_ssh_host"
+    _setup_ssh 
     [ -n "$cm" ] && [ -n "$session" ]
 
-    # Get information from the remote
-    local _remote_home=
-    local _jobs_dir=
     local _job_entries=
+    _job_entries=$(_get_job_info | grep "^${_job_id_prefix}")
+
     local _no_entries=
-    _remote_home=$(ssh -S "${cm}" "${_ssh_host}" "printenv HOME")
-    _jobs_dir="${_remote_home}/${_JOBS_DIRNAME}"
-    _job_entries=$(ssh -S "${cm}" "${_ssh_host}" \
-        "find $_jobs_dir -name .details -exec cat {} + "\
-        "| grep \"^${_job_id_prefix}\"" \
-        "| sort -k4nr -k3"
-    )
     _no_entries=$(echo "${_job_entries}" | wc -l)
 
     # Print information by groups
@@ -946,6 +958,129 @@ mrun_status() {
             fi
         done
     fi
+
+    _teardown_ssh
+}
+
+
+# show ########################################################################
+
+describe "show" <<HEREDOC
+Usage:
+  ${_ME} show <ssh-host> <mrun-id> [ <command-no> ]
+                                 [ -o | --out ]
+                                 [ -e | --err]
+
+Description:
+  Get the standard output and standard error of jobs.
+  Note: Prints both if not specified otherwise.
+
+Options:
+  -o | --out
+    Get the standard output.
+
+  -e | --err
+    Get the standard error.
+HEREDOC
+mrun_show() {
+    MRUN_SSH_HOST="${1:-}"
+    [[ -n "${MRUN_SSH_HOST}" ]] ||
+        _die 1 "SSH host not specified!"
+    shift
+
+    local _mrun_id="${1:-}"
+    [[ -n "${_mrun_id}" ]] ||
+        _die 1 "No job ID specified!"
+    shift
+    
+    local _show_stdout=true
+    local _show_stderr=true
+    local _command_no=
+    while (("$#")); do
+        case "$1" in
+        -o | --out )
+            _debug "showing standard output"
+
+            _show_stdout=true
+            _show_stderr=false
+
+            shift
+            ;;
+        -e | --err )
+            _debug "showing standard error"
+
+            _show_stdout=false
+            _show_stderr=true
+
+            shift
+            ;;
+        *)
+            if _blank "${_command_no}"
+            then 
+                _command_no="$1"
+            else
+                _die 1 "Unexpected argument $1"
+            fi
+
+            shift
+            ;;
+        esac
+    done
+
+    _check_tools
+
+    _setup_ssh
+    { [ -n "$cm" ] && [ -n "$session" ] ; } || _die 1 "Could not start ssh!"
+
+    local _job_entries=
+    _job_entries=$(_get_job_info "${MRUN_SSH_HOST}")
+    _job_entries=$(echo "${_job_entries}" \
+        | grep "^${_mrun_id}"
+    )
+    if [[ -n ${_command_no} ]]; then
+        _job_entries=$(echo "${_job_entries}" | awk "\$3 == ${_command_no}")
+    fi
+
+    local _remote_home=
+    _remote_home=$(ssh -n -S "${cm}" "${MRUN_SSH_HOST}" "printenv HOME")
+    local _jobs_dir="${_remote_home}/${_JOBS_DIRNAME}"
+    while read -r _entry
+    do
+        read -ra _entry <<<"${_entry}"
+
+        local _mrun_id="${_entry[0]}"
+        local _job_name="${_entry[1]}"
+        local _command_no="${_entry[2]}"
+        local _job_id="${_entry[4]}"
+
+        _out_dir="${_jobs_dir}/${_job_name}/out/${_mrun_id}/${_command_no}"
+
+        printf "%s" "$(tput setaf 4)" # blue
+        printf "┌  %s/%s (%s)\n" "${_mrun_id}" "${_command_no}" "${_job_name}"
+        printf "│\n"
+        printf "├ STDOUT:\n\n"
+        _reset_color
+
+        _out_file="${_out_dir}/${_job_id}.OU"
+        # TODO CHECK FILE EXISTS
+        printf '%s\n' "$(ssh -n -S "${cm}" "${MRUN_SSH_HOST}" "cat ${_out_file}")"
+
+        printf "%s" "$(tput setaf 4)" # blue
+        printf "\n├--------------------\n"
+        printf "├ STDERR:\n\n"
+        _reset_color
+
+        _err_file="${_out_dir}/${_job_id}.ER"
+        # TODO CHECK FILE EXISTS
+        printf '%s\n' "$(ssh -n -S "${cm}" "${MRUN_SSH_HOST}" "cat ${_err_file}")"
+
+        printf "%s" "$(tput setaf 4)" # blue
+        printf "\n└--------------------\n"
+        _reset_color
+
+        echo
+
+    done < <(echo "$_job_entries")
 
     _teardown_ssh
 }
